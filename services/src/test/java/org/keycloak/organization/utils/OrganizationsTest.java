@@ -57,4 +57,9 @@ class OrganizationsTest {
     void emailHasPlusLocalPart_plusAtStartOfLocalPart_returnsTrue() {
         assertTrue(Organizations.emailHasPlusLocalPart("+user@example.com"));
     }
+
+    @Test
+    void emailHasPlusLocalPart_plusImmediatelyBeforeAt_returnsTrue() {
+        assertTrue(Organizations.emailHasPlusLocalPart("user+@example.com"));
+    }
 }

@@ -325,9 +325,7 @@ public class Organizations {
             return false;
         }
 
-        String email = user != null ? user.getEmail() : null;
-
-        if (isPlusAddressingRejected(organization, email)) {
+        if (isPlusAddressingRejected(organization, user != null ? user.getEmail() : null)) {
             return false;
         }
 
@@ -359,9 +357,6 @@ public class Organizations {
             return false;
         }
         Map<String, List<String>> attrs = organization.getAttributes();
-        if (attrs == null) {
-            return false;
-        }
         List<String> flag = attrs.get(OrganizationModel.DOMAIN_REJECT_PLUS_ADDRESSING);
         if (flag == null || flag.isEmpty()) {
             return false;
