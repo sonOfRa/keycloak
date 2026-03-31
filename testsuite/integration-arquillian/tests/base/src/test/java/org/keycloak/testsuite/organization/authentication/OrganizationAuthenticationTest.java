@@ -25,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import jakarta.ws.rs.core.Response;
 
 import org.keycloak.admin.client.resource.OrganizationResource;
+import org.keycloak.models.OrganizationModel;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel.RequiredAction;
 import org.keycloak.models.utils.DefaultAuthenticationFlows;
@@ -397,6 +398,41 @@ public class OrganizationAuthenticationTest extends AbstractOrganizationTest {
         
         // Clean up
         testRealm().users().get(memberId).remove();
+    }
+
+    @Test
+    public void testPlusAddressingRejectedWhenFlagEnabled() {
+        // --- Org 1: flag enabled, plus-addressed email should NOT match ---
+        OrganizationRepresentation org1 = createOrganization("plusreject");
+        OrganizationResource org1Resource = testRealm().organizations().get(org1.getId());
+        org1.singleAttribute(OrganizationModel.DOMAIN_REJECT_PLUS_ADDRESSING, "true");
+        org1Resource.update(org1).close();
+
+        // Submit a plus-addressed email whose domain belongs to org1.
+        // Because the flag is set the org authenticator must NOT match the org,
+        // so it calls attempted() and the next step shows username + password.
+        openIdentityFirstLoginPage("user+tag@plusreject.org", false, null, false, false);
+
+        // No org was resolved → standard username/password form
+        loginPage.assertAttemptedUsernameAvailability(true);
+        Assert.assertTrue("Password input must be present when org is not matched",
+                loginPage.isPasswordInputPresent());
+
+        // --- Org 2: no flag (default), plus-addressed email SHOULD match ---
+        createOrganization("plusallow");
+
+        // Submit a plus-addressed email whose domain belongs to org2.
+        // The flag is absent so the org authenticator DOES match the org.
+        // The user does not exist → unknownUserChallenge(domainMatch=true) re-shows
+        // the username form with an error; password input is NOT shown.
+        openIdentityFirstLoginPage("user+tag@plusallow.org", false, null, false, false);
+
+        // Org was resolved → unknownUserChallenge, no password, error shown
+        Assert.assertFalse("Password input must NOT be present when org is matched but user is unknown",
+                loginPage.isPasswordInputPresent());
+        assertThat("Error must mention that the domain matched an org but the user has no account",
+                loginPage.getError(),
+                Matchers.containsString("Your email domain matches an organization"));
     }
 
     private void runOnServer(RunOnServer function) {
