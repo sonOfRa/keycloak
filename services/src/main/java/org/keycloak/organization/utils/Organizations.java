@@ -19,6 +19,7 @@ package org.keycloak.organization.utils;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -197,6 +198,22 @@ public class Organizations {
         return getEmailDomain(user.getEmail());
     }
 
+    /**
+     * Returns {@code true} when the local-part of {@code email} (the part before {@literal @})
+     * contains a {@literal +} character, which indicates RFC 5321 plus-addressing / sub-addressing.
+     * Returns {@code false} for {@code null} or malformed addresses.
+     */
+    public static boolean emailHasPlusLocalPart(String email) {
+        if (email == null) {
+            return false;
+        }
+        int atIndex = email.indexOf('@');
+        if (atIndex == -1) {
+            return false;
+        }
+        return email.indexOf('+') < atIndex;
+    }
+
     public static OrganizationModel resolveOrganization(KeycloakSession session) {
         return resolveOrganization(session, null, null);
     }
@@ -307,19 +324,48 @@ public class Organizations {
             return false;
         }
 
+        String email = user != null ? user.getEmail() : null;
+
+        if (isPlusAddressingRejected(organization, email)) {
+            return false;
+        }
+
         Stream<OrganizationDomainModel> domains = organization.getDomains();
 
         return domains.map(OrganizationDomainModel::getName).anyMatch(emailDomain::equals);
     }
 
     private static OrganizationModel resolveOrganizationByDomain(UserModel user, String domain, OrganizationProvider provider) {
+        String originalEmail = user != null ? user.getEmail() : null;
+
         if (user != null && domain == null) {
-            domain = getEmailDomain(user);
+            domain = getEmailDomain(originalEmail);
         }
 
         return ofNullable(domain)
                 .map(provider::getByDomainName)
+                .filter(org -> !isPlusAddressingRejected(org, originalEmail))
                 .orElse(null);
+    }
+
+    /**
+     * Returns {@code true} when {@code organization} has the
+     * {@link OrganizationModel#DOMAIN_REJECT_PLUS_ADDRESSING} attribute set to {@code "true"} AND
+     * the supplied {@code email} contains a plus sign in its local-part.
+     */
+    private static boolean isPlusAddressingRejected(OrganizationModel organization, String email) {
+        if (organization == null || email == null) {
+            return false;
+        }
+        Map<String, List<String>> attrs = organization.getAttributes();
+        if (attrs == null) {
+            return false;
+        }
+        List<String> flag = attrs.get(OrganizationModel.DOMAIN_REJECT_PLUS_ADDRESSING);
+        if (flag == null || flag.isEmpty()) {
+            return false;
+        }
+        return Boolean.parseBoolean(flag.get(0)) && emailHasPlusLocalPart(email);
     }
 
     private static Optional<OrganizationModel> resolveUserOrganization(List<OrganizationModel> organizations, UserModel user, String domain) {
