@@ -211,7 +211,8 @@ public class Organizations {
         if (atIndex == -1) {
             return false;
         }
-        return email.indexOf('+') < atIndex;
+        int plusIndex = email.indexOf('+');
+        return plusIndex != -1 && plusIndex < atIndex;
     }
 
     public static OrganizationModel resolveOrganization(KeycloakSession session) {
