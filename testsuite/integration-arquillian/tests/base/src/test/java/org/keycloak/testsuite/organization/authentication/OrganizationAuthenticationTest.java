@@ -27,9 +27,12 @@ import jakarta.ws.rs.core.Response;
 import org.keycloak.admin.client.resource.OrganizationResource;
 import org.keycloak.models.OrganizationModel;
 import org.keycloak.models.RealmModel;
+import org.keycloak.models.UserModel;
 import org.keycloak.models.UserModel.RequiredAction;
+import org.keycloak.organization.OrganizationProvider;
 import org.keycloak.models.utils.DefaultAuthenticationFlows;
 import org.keycloak.organization.authentication.authenticators.browser.OrganizationAuthenticatorFactory;
+import org.keycloak.representations.idm.MemberRepresentation;
 import org.keycloak.representations.idm.OrganizationRepresentation;
 import org.keycloak.representations.idm.RealmRepresentation;
 import org.keycloak.representations.idm.UserRepresentation;
@@ -433,6 +436,50 @@ public class OrganizationAuthenticationTest extends AbstractOrganizationTest {
         assertThat("Error must mention that the domain matched an org but the user has no account",
                 loginPage.getError(),
                 Matchers.containsString("Your email domain matches an organization"));
+    }
+
+    /**
+     * Exploratory test: what happens when a user with a plus-addressed email (alice+tag@plusmember.org)
+     * was a MANAGED member BEFORE the reject-plus-addressing flag was enabled on the org,
+     * and then tries to log in AFTER the flag is enabled?
+     *
+     * Managed members are linked to an IDP (they cannot exist without the org). We create one
+     * directly server-side to simulate the state left behind after a broker login.
+     *
+     * This test prints what actually happens rather than asserting, so we can observe the behaviour.
+     */
+    @Test
+    public void testExistingPlusAddressedMemberAfterFlagEnabled() {
+        // Create org BEFORE enabling the flag
+        OrganizationRepresentation org = createOrganization("plusmember");
+        OrganizationResource orgResource = testRealm().organizations().get(org.getId());
+        final String orgId = org.getId();
+
+        // Create alice+tag@plusmember.org without a password (managed members authenticate via IDP, not password),
+        // then promote to MANAGED server-side to simulate the state left after a broker login
+        String aliceId = addMember(orgResource, "alice+tag@plusmember.org", null, null, null, false).getId();
+        runOnServer(session -> {
+            RealmModel realm = session.getContext().getRealm();
+            UserModel alice = session.users().getUserById(realm, aliceId);
+            OrganizationProvider provider = session.getProvider(OrganizationProvider.class);
+            OrganizationModel orgModel = provider.getById(orgId);
+            // Remove and re-add as managed to simulate what broker login would have done
+            provider.removeMember(orgModel, alice);
+            provider.addManagedMember(orgModel, alice);
+        });
+
+        // Now enable the flag
+        org.singleAttribute(OrganizationModel.DOMAIN_REJECT_PLUS_ADDRESSING, "true");
+        orgResource.update(org).close();
+
+        // alice+tag@plusmember.org logs in — she is an existing MANAGED member.
+        // For a managed member with no password, the org authenticator should redirect to the IDP.
+        // Pass autoIDPRedirect=true so openIdentityFirstLoginPage accepts landing on the provider realm.
+        openIdentityFirstLoginPage("alice+tag@plusmember.org", true, null, false, false);
+
+        System.out.println("[testExistingPlusAddressedMemberAfterFlagEnabled] currentUrl=" + driver.getCurrentUrl());
+        System.out.println("[testExistingPlusAddressedMemberAfterFlagEnabled] onProviderRealm=" +
+                driver.getCurrentUrl().contains("/auth/realms/" + bc.providerRealmName() + "/"));
     }
 
     private void runOnServer(RunOnServer function) {
