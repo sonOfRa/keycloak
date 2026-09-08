@@ -14,74 +14,126 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.keycloak.testsuite.client.policies;
+package org.keycloak.tests.client.policies;
 
+import java.net.URI;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import org.keycloak.OAuthErrorException;
+import org.keycloak.client.registration.Auth;
+import org.keycloak.client.registration.ClientRegistration;
 import org.keycloak.client.registration.ClientRegistrationException;
 import org.keycloak.events.Details;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventType;
 import org.keycloak.protocol.oidc.OIDCLoginProtocol;
+import org.keycloak.representations.idm.ClientInitialAccessCreatePresentation;
+import org.keycloak.representations.idm.ClientInitialAccessPresentation;
 import org.keycloak.representations.idm.ClientRepresentation;
-import org.keycloak.representations.idm.RealmRepresentation;
+import org.keycloak.representations.idm.ComponentRepresentation;
 import org.keycloak.representations.oidc.OIDCClientRepresentation;
 import org.keycloak.services.clientpolicy.ClientPolicyException;
 import org.keycloak.services.clientpolicy.condition.AnyClientConditionFactory;
 import org.keycloak.services.clientpolicy.condition.ClientProtocolConditionFactory;
+import org.keycloak.services.clientpolicy.executor.SecureRedirectUrisEnforcerExecutor;
 import org.keycloak.services.clientpolicy.executor.SecureRedirectUrisEnforcerExecutorFactory;
+import org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy;
+import org.keycloak.services.clientregistration.policy.impl.TrustedHostClientRegistrationPolicyFactory;
+import org.keycloak.testframework.annotations.InjectEvents;
+import org.keycloak.testframework.annotations.InjectKeycloakUrls;
+import org.keycloak.testframework.annotations.InjectRealm;
+import org.keycloak.testframework.annotations.InjectUser;
+import org.keycloak.testframework.annotations.KeycloakIntegrationTest;
 import org.keycloak.testframework.events.EventAssertion;
-import org.keycloak.testsuite.util.ClientPoliciesUtil;
-import org.keycloak.testsuite.util.ServerURLs;
+import org.keycloak.testframework.events.Events;
+import org.keycloak.testframework.oauth.OAuthClient;
+import org.keycloak.testframework.oauth.TestApp;
+import org.keycloak.testframework.oauth.annotations.InjectOAuthClient;
+import org.keycloak.testframework.oauth.annotations.InjectTestApp;
+import org.keycloak.testframework.realm.ManagedRealm;
+import org.keycloak.testframework.realm.ManagedUser;
+import org.keycloak.testframework.realm.UserBuilder;
+import org.keycloak.testframework.realm.UserConfig;
+import org.keycloak.testframework.server.KeycloakUrls;
+import org.keycloak.testframework.ui.annotations.InjectPage;
+import org.keycloak.testframework.ui.page.ErrorPage;
 import org.keycloak.testsuite.util.oauth.AccessTokenResponse;
 import org.keycloak.testsuite.util.oauth.AuthorizationEndpointResponse;
 
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
-import static org.keycloak.testsuite.AbstractAdminTest.loadJson;
-import static org.keycloak.testsuite.util.ClientPoliciesUtil.createAnyClientConditionConfig;
-import static org.keycloak.testsuite.util.ClientPoliciesUtil.createClientProtocolConditionConfig;
-import static org.keycloak.testsuite.util.ClientPoliciesUtil.createSecureRedirectUrisEnforcerExecutorConfig;
+import static org.keycloak.tests.utils.ClientPoliciesUtil.createAnyClientConditionConfig;
+import static org.keycloak.tests.utils.ClientPoliciesUtil.createClientProtocolConditionConfig;
+import static org.keycloak.tests.utils.ClientPoliciesUtil.createSecureRedirectUrisEnforcerExecutorConfig;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 
+@KeycloakIntegrationTest
 public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPoliciesTest {
 
-    @Override
-    public void addTestRealms(List<RealmRepresentation> testRealms) {
-        RealmRepresentation realm = loadJson(getClass().getResourceAsStream("/testrealm.json"), RealmRepresentation.class);
-        testRealms.add(realm);
+    private static final String CLIENT_NAME = "Zahlungs-App";
+    private static final String ERR_MSG_CLIENT_REG_FAIL = "Failed to send request";
+
+    @InjectRealm
+    ManagedRealm realm;
+
+    @InjectOAuthClient
+    OAuthClient oauth;
+
+    @InjectTestApp
+    TestApp testApp;
+
+    @InjectUser(config = TestUserConfig.class)
+    ManagedUser user;
+
+    @InjectPage
+    ErrorPage errorPage;
+
+    @InjectEvents
+    Events events;
+
+    @InjectKeycloakUrls
+    KeycloakUrls keycloakUrls;
+
+    private ClientRegistration reg;
+
+    @BeforeEach
+    public void setupDynamicClientRegistration() {
+        // dynamic registration of the clients used here would otherwise be rejected by the anonymous trusted-host policy
+        List<ComponentRepresentation> trustedHostPolicies = realm.admin().components()
+                .query(null, ClientRegistrationPolicy.class.getCanonicalName())
+                .stream()
+                .filter(c -> TrustedHostClientRegistrationPolicyFactory.PROVIDER_ID.equals(c.getProviderId()))
+                .toList();
+        for (ComponentRepresentation policy : trustedHostPolicies) {
+            realm.admin().components().removeComponent(policy.getId());
+        }
+
+        reg = ClientRegistration.create().url(keycloakUrls.getBase(), realm.getName()).build();
+        ClientInitialAccessPresentation token = realm.admin().clientInitialAccess()
+                .create(new ClientInitialAccessCreatePresentation(0, 100));
+        reg.auth(Auth.token(token));
+    }
+
+    @AfterEach
+    public void closeDynamicClientRegistration() throws ClientRegistrationException {
+        reg.close();
     }
 
     @Test
     public void testNotRedirectBasedFlowClient_normalUri() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {});
 
         // The executor's check logic is not executed to an auth code flow or implicit flow disabled client.
 
@@ -91,7 +143,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         String cId = null;
         try {
             clientId = generateSuffixedName(CLIENT_NAME);
-            cId = createClientByAdmin(clientId, (ClientRepresentation clientRep) -> {
+            cId = createClientByAdmin(realm, clientId, OIDCLoginProtocol.LOGIN_PROTOCOL, (ClientRepresentation clientRep) -> {
                 clientRep.setSecret("secret");
                 clientRep.setRedirectUris(List.of("http://oauth.redirect/some")); // normally, a redirect url with http scheme is not allowed.
                 clientRep.setStandardFlowEnabled(false);
@@ -107,7 +159,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         // Update
         // Success - even if not setting a valid redirect uri
         try {
-            updateClientByAdmin(cId, (ClientRepresentation clientRep) -> {
+            updateClientByAdmin(realm, cId, (ClientRepresentation clientRep) -> {
                 clientRep.setAttributes(new HashMap<>());
                 clientRep.setRedirectUris(List.of("")); // empty redirect uris are filtered out before persistence.
             });
@@ -120,24 +172,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_normalUri() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {});
 
         // register - fail
         // no redirect uri is not allowed
@@ -174,25 +209,11 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_IPv4LoopbackAddress() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->
-                                    it.setAllowIPv4LoopbackAddress(true)))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        // the test application is served over http on a loopback address, so the http scheme has to be permitted as well
+        setupPolicy(it -> {
+            it.setAllowIPv4LoopbackAddress(true);
+            it.setAllowHttpScheme(true);
+        });
 
         // register - fail
         // IPv6 loopback address not allowed
@@ -212,40 +233,22 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
         // update - success
         testSecureRedirectUrisEnforcerExecutor_successUpdateByAdmin(alphaCid,
-                List.of("/auth/realms/master/app/auth", "https://dev.example.com/redirect/update"));
+                List.of(testApp.getRedirectionUri(), "https://dev.example.com/redirect/update"));
 
         // authorization request - fail
         // invalid uri form
         testSecureRedirectUrisEnforcerExecutor_failAuthorizationRequest(alphaClientId, "https://keycloak.org\n");
 
         // authorization request - success
-        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, ServerURLs.getAuthServerContextRoot() + "/auth/realms/master/app/auth");
+        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, testApp.getRedirectionUri());
     }
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_IPv6LoopbackAddress() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it-> {
-                                    it.setOAuth2_1Compliant(true);
-                                    it.setAllowIPv6LoopbackAddress(true);
-                                })
-                        )
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {
+            it.setOAuth2_1Compliant(true);
+            it.setAllowIPv6LoopbackAddress(true);
+        });
 
         // register - fail
         // IPv4 loopback address not allowed
@@ -276,25 +279,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_PrivateUseUriScheme() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->
-                                    it.setAllowPrivateUseUriScheme(true)))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> it.setAllowPrivateUseUriScheme(true));
 
         // register - fail
         // invalid uri form
@@ -323,27 +308,11 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_AllowHttpScheme() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{
-                                    it.setAllowIPv4LoopbackAddress(true);
-                                    it.setAllowIPv6LoopbackAddress(true);
-                                    it.setAllowHttpScheme(true);}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {
+            it.setAllowIPv4LoopbackAddress(true);
+            it.setAllowIPv6LoopbackAddress(true);
+            it.setAllowHttpScheme(true);
+        });
 
         // register - success
         List<String> registerResultList = testSecureRedirectUrisEnforcerExecutor_successRegisterByAdmin(
@@ -353,41 +322,25 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
         // update - success
         testSecureRedirectUrisEnforcerExecutor_successUpdateByAdmin(alphaCid,
-                Arrays.asList("http://[::1]:8080/redirect", ServerURLs.getAuthServerContextRoot() + "/auth/realms/master/app/auth"));
+                Arrays.asList("http://[::1]:8080/redirect", testApp.getRedirectionUri()));
 
         // authorization request - fail
         // redirect_uri not match with registered redirect uris
         testSecureRedirectUrisEnforcerExecutor_failAuthorizationRequest(alphaClientId, "http://[::1]:8080/");
 
         // authorization request - success
-        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, ServerURLs.getAuthServerContextRoot() + "/auth/realms/master/app/auth");
+        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, testApp.getRedirectionUri());
     }
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_AllowWildcardContextPath() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{
-                                    it.setAllowPrivateUseUriScheme(true);
-                                    it.setAllowIPv4LoopbackAddress(true);
-                                    it.setAllowIPv6LoopbackAddress(true);
-                                    it.setAllowHttpScheme(true);
-                                    it.setAllowWildcardContextPath(true);}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {
+            it.setAllowPrivateUseUriScheme(true);
+            it.setAllowIPv4LoopbackAddress(true);
+            it.setAllowIPv6LoopbackAddress(true);
+            it.setAllowHttpScheme(true);
+            it.setAllowWildcardContextPath(true);
+        });
 
         // register - success
         List<String> registerResultList = testSecureRedirectUrisEnforcerExecutor_successRegisterByAdmin(
@@ -397,41 +350,25 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
         // update - success
         testSecureRedirectUrisEnforcerExecutor_successUpdateByAdmin(alphaCid,
-                Arrays.asList("http://[::1]:8080/*", ServerURLs.getAuthServerContextRoot() + "/*"));
+                Arrays.asList("http://[::1]:8080/*", testAppWildcardUri()));
 
         // authorization request - fail
         // redirect_uri not match with registered redirect uris
         testSecureRedirectUrisEnforcerExecutor_failAuthorizationRequest(alphaClientId, "com.example.app:/oauth2redirect/example-provider");
 
         // authorization request - success
-        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, ServerURLs.getAuthServerContextRoot() + "/auth/realms/master/app/auth");
+        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, testApp.getRedirectionUri());
     }
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_AllowPermittedDomains() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{
-                                    it.setAllowIPv4LoopbackAddress(true);
-                                    it.setAllowPermittedDomains(Arrays.asList(
-                                            "oauth.redirect", "((dev|test)-)*example.org", "localhost"));
-                                    it.setAllowHttpScheme(true);
-                                    it.setAllowWildcardContextPath(true);}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {
+            it.setAllowIPv4LoopbackAddress(true);
+            it.setAllowPermittedDomains(Arrays.asList(
+                    "oauth.redirect", "((dev|test)-)*example.org", "localhost"));
+            it.setAllowHttpScheme(true);
+            it.setAllowWildcardContextPath(true);
+        });
 
         // register - fail
         // not match permitted domains
@@ -450,7 +387,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
         // update using rootUrl - fail
         try {
-            updateClientByAdmin(alphaCid, (ClientRepresentation clientRep) -> {
+            updateClientByAdmin(realm, alphaCid, (ClientRepresentation clientRep) -> {
                 clientRep.setAttributes(new HashMap<>());
                 clientRep.setRootUrl("http://incorrect.org");
                 clientRep.setRedirectUris(List.of("/redirect"));
@@ -461,7 +398,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         }
 
         // update using rootUrl - success
-        updateClientByAdmin(alphaCid, (ClientRepresentation clientRep) -> {
+        updateClientByAdmin(realm, alphaCid, (ClientRepresentation clientRep) -> {
             clientRep.setAttributes(new HashMap<>());
             clientRep.setRootUrl("http://dev-example.org");
             clientRep.setRedirectUris(List.of("/redirect"));
@@ -470,42 +407,27 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         assertEquals(List.of("/redirect"), cRep.getRedirectUris());
 
         // update - success
+        // the test application is served from a loopback address, which is validated as a loopback uri and not against the permitted domains
         testSecureRedirectUrisEnforcerExecutor_successUpdateByAdmin(alphaCid,
-                Arrays.asList("http://oauth.redirect/*", "http://dev-example.org/redirect", ServerURLs.getAuthServerContextRoot() + "/*"));
+                Arrays.asList("http://oauth.redirect/*", "http://dev-example.org/redirect", testAppWildcardUri()));
 
         // authorization request - fail
         // redirect_uri not match with registered redirect uris
         testSecureRedirectUrisEnforcerExecutor_failAuthorizationRequest(alphaClientId, "http://dev-example.org/v2/redirect");
 
         // authorization request - success
-        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, ServerURLs.getAuthServerContextRoot() + "/auth/realms/master/app/auth");
+        testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(alphaClientId, testApp.getRedirectionUri());
     }
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_OAuth2_1Compliant() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{
-                                    it.setAllowPrivateUseUriScheme(true);
-                                    it.setAllowIPv4LoopbackAddress(true);
-                                    it.setAllowIPv6LoopbackAddress(true);
-                                    it.setAllowHttpScheme(true);
-                                    it.setOAuth2_1Compliant(true);}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {
+            it.setAllowPrivateUseUriScheme(true);
+            it.setAllowIPv4LoopbackAddress(true);
+            it.setAllowIPv6LoopbackAddress(true);
+            it.setAllowHttpScheme(true);
+            it.setOAuth2_1Compliant(true);
+        });
 
         // register - fail
         // IPv4 loopback address with port number not allowed
@@ -532,29 +454,14 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_OAuth2_0Compliant() throws Exception {
-        // register profiles - OAuth 2.0 compliant rejects fragments and wildcards
+        // OAuth 2.0 compliant rejects fragments and wildcards
         // but is less strict than OAuth 2.1 (allows localhost, HTTP, single-word schemes)
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{
-                                    it.setAllowIPv4LoopbackAddress(true);
-                                    it.setAllowIPv6LoopbackAddress(true);
-                                    it.setAllowHttpScheme(true);
-                                    it.setOAuth2_0Compliant(true);}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {
+            it.setAllowIPv4LoopbackAddress(true);
+            it.setAllowIPv6LoopbackAddress(true);
+            it.setAllowHttpScheme(true);
+            it.setOAuth2_0Compliant(true);
+        });
 
         // register - fail
         // fragment in redirect URI not allowed per RFC 6749
@@ -589,25 +496,10 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_AllowOpenRedirect() throws Exception {
         // Allow open redirect
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it->{
-                                    it.setAllowOpenRedirect(true);
-                                    it.setOAuth2_1Compliant(true);}))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> {
+            it.setAllowOpenRedirect(true);
+            it.setOAuth2_1Compliant(true);
+        });
 
         // register - success
         // open redirect is allowed in any running mode
@@ -616,33 +508,15 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     @Test
     public void testSecureRedirectUrisEnforcerExecutor_postLogoutRedirectUris() throws Exception {
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it-> it.setAllowPermittedDomains(List.of("oauth.redirect")))
-                        )
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(AnyClientConditionFactory.PROVIDER_ID,
-                                createAnyClientConditionConfig())
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(it -> it.setAllowPermittedDomains(List.of("oauth.redirect")));
 
         // Success - register without post-logout redirect uris
-        String clientId = testSecureRedirectUrisEnforcerExecutor_successRegisterDynamically(List.of("https://oauth.redirect/something"));
+        String clientId = testSecureRedirectUrisEnforcerExecutor_successRegisterDynamicallyForUpdate(List.of("https://oauth.redirect/something"));
 
         // Success - update with post-logout redirect uris as "+"
-        updateClientDynamically(clientId, (OIDCClientRepresentation clientRep) -> {
-                clientRep.setRedirectUris(List.of("https://oauth.redirect/some"));
-                clientRep.setPostLogoutRedirectUris(List.of("+"));
+        updateClientDynamically(reg, clientId, (OIDCClientRepresentation clientRep) -> {
+            clientRep.setRedirectUris(List.of("https://oauth.redirect/some"));
+            clientRep.setPostLogoutRedirectUris(List.of("+"));
         });
         OIDCClientRepresentation clientRepp = reg.oidc().get(clientId);
         Assertions.assertEquals(List.of("https://oauth.redirect/some"), clientRepp.getRedirectUris());
@@ -650,7 +524,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
         // Fail - incorrect domain for post-logout redirect uri
         try {
-            updateClientDynamically(clientId, (OIDCClientRepresentation clientRep) -> {
+            updateClientDynamically(reg, clientId, (OIDCClientRepresentation clientRep) -> {
                 clientRep.setRedirectUris(List.of("https://oauth.redirect/some"));
                 clientRep.setPostLogoutRedirectUris(List.of("https://incorrect.domain/some"));
             });
@@ -660,7 +534,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         }
 
         // Success - update with post-logout redirect uris as "+"
-        updateClientDynamically(clientId, (OIDCClientRepresentation clientRep) -> {
+        updateClientDynamically(reg, clientId, (OIDCClientRepresentation clientRep) -> {
             clientRep.setRedirectUris(List.of("https://oauth.redirect/some"));
             clientRep.setPostLogoutRedirectUris(List.of("https://oauth.redirect/some-post-logout"));
         });
@@ -673,40 +547,44 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
     public void testSecureRedirectUrisEnforcerExecutor_authorizationRequestWithClientProtocolConditionOidc() throws Exception {
         // Create a client before enabling the policy.
         // The redirect URI is registered, so the standard redirect_uri validation should pass.
+        // The error is reported by redirecting back to the client, so the redirect URI has to be reachable.
         List<String> registerResultList = testSecureRedirectUrisEnforcerExecutor_successRegisterByAdmin(
-                List.of("http://oauth.redirect/some"));
+                List.of(testApp.getRedirectionUri()));
         String alphaClientId = registerResultList.get(0);
 
-        // register profiles
-        String json = (new ClientPoliciesUtil.ClientProfilesBuilder()).addProfile(
-                (new ClientPoliciesUtil.ClientProfileBuilder()).createProfile(PROFILE_NAME, "Le Premier Profil")
-                        .addExecutor(SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
-                                createSecureRedirectUrisEnforcerExecutorConfig(it -> {
-                                    it.setAllowHttpScheme(false);
-                                }))
-                        .toRepresentation()
-        ).toString();
-        updateProfiles(json);
-
-        // register policies
-        json = (new ClientPoliciesUtil.ClientPoliciesBuilder()).addPolicy(
-                (new ClientPoliciesUtil.ClientPolicyBuilder()).createPolicy(POLICY_NAME, "La Premiere Politique", Boolean.TRUE)
-                        .addCondition(ClientProtocolConditionFactory.PROVIDER_ID,
-                                createClientProtocolConditionConfig(OIDCLoginProtocol.LOGIN_PROTOCOL))
-                        .addProfile(PROFILE_NAME)
-                        .toRepresentation()
-        ).toString();
-        updatePolicies(json);
+        setupPolicy(realm, SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
+                createSecureRedirectUrisEnforcerExecutorConfig(it -> {
+                    it.setAllowIPv4LoopbackAddress(true);
+                    it.setAllowHttpScheme(false);
+                }),
+                ClientProtocolConditionFactory.PROVIDER_ID,
+                createClientProtocolConditionConfig(OIDCLoginProtocol.LOGIN_PROTOCOL));
 
         // authorization request - fail
         // The redirect_uri matches the registered redirect URI, but HTTP scheme should be rejected
         // by secure-redirect-uris-enforcer when AUTHORIZATION_REQUEST is enforced.
-        testSecureRedirectUrisEnforcerExecutor_failAuthorizationRequestWithRedirectUriToClient(alphaClientId, "http://oauth.redirect/some");
+        testSecureRedirectUrisEnforcerExecutor_failAuthorizationRequestWithRedirectUriToClient(alphaClientId, testApp.getRedirectionUri());
+    }
+
+    private void setupPolicy(Consumer<SecureRedirectUrisEnforcerExecutor.Configuration> executorConfig) throws Exception {
+        setupPolicy(realm, SecureRedirectUrisEnforcerExecutorFactory.PROVIDER_ID,
+                createSecureRedirectUrisEnforcerExecutorConfig(executorConfig),
+                AnyClientConditionFactory.PROVIDER_ID, createAnyClientConditionConfig());
+    }
+
+    private ClientRepresentation getClientByAdmin(String cId) {
+        return realm.admin().clients().get(cId).toRepresentation();
+    }
+
+    // The test application is served over http from a loopback address on a random port
+    private String testAppWildcardUri() {
+        URI redirectionUri = URI.create(testApp.getRedirectionUri());
+        return redirectionUri.getScheme() + "://" + redirectionUri.getAuthority() + "/*";
     }
 
     private void testSecureRedirectUrisEnforcerExecutor_failRegisterByAdmin(List<String> redirectUrisList) {
         try {
-            createClientByAdmin(generateSuffixedName(CLIENT_NAME), (ClientRepresentation clientRep) -> {
+            createClientByAdmin(realm, generateSuffixedName(CLIENT_NAME), OIDCLoginProtocol.LOGIN_PROTOCOL, (ClientRepresentation clientRep) -> {
                 clientRep.setSecret("secret");
                 clientRep.setRedirectUris(redirectUrisList);
             });
@@ -718,9 +596,9 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     private void testSecureRedirectUrisEnforcerExecutor_failRegisterDynamically(List<String> redirectUrisList) {
         try {
-            createClientDynamically(generateSuffixedName(CLIENT_NAME), (OIDCClientRepresentation clientRep) ->
+            createClientDynamically(realm, reg, generateSuffixedName(CLIENT_NAME), (OIDCClientRepresentation clientRep) ->
                 clientRep.setRedirectUris(redirectUrisList));
-            fail("Expected to fail with redirectUris: " +redirectUrisList);
+            fail("Expected to fail with redirectUris: " + redirectUrisList);
         } catch (ClientRegistrationException cre) {
             assertEquals(ERR_MSG_CLIENT_REG_FAIL, cre.getMessage());
         }
@@ -732,7 +610,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         String alphaCid = null;
         try {
             alphaClientId = generateSuffixedName(CLIENT_NAME);
-            alphaCid = createClientByAdmin(alphaClientId, (ClientRepresentation clientRep) -> {
+            alphaCid = createClientByAdmin(realm, alphaClientId, OIDCLoginProtocol.LOGIN_PROTOCOL, (ClientRepresentation clientRep) -> {
                 clientRep.setSecret("secret");
                 clientRep.setRedirectUris(redirectUrisList);
             });
@@ -747,11 +625,21 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
         return Arrays.asList(alphaClientId, alphaCid);
     }
 
-    // Return clientId (not DB UUID)
-    private String testSecureRedirectUrisEnforcerExecutor_successRegisterDynamically(List<String> redirectUrisList) {
+    // Return clientId (not DB UUID). Unlike createClientDynamically in the base class this keeps the registration
+    // access token of the created client, so that the client can be updated dynamically afterwards.
+    private String testSecureRedirectUrisEnforcerExecutor_successRegisterDynamicallyForUpdate(List<String> redirectUrisList) {
         try {
-            return createClientDynamically(generateSuffixedName(CLIENT_NAME), (OIDCClientRepresentation clientRep) ->
-                    clientRep.setRedirectUris(redirectUrisList));
+            OIDCClientRepresentation clientRep = new OIDCClientRepresentation();
+            clientRep.setClientName(generateSuffixedName(CLIENT_NAME));
+            clientRep.setRedirectUris(redirectUrisList);
+
+            OIDCClientRepresentation response = reg.oidc().create(clientRep);
+            reg.auth(Auth.token(response));
+
+            String clientId = response.getClientId();
+            realm.cleanup().add(r -> r.clients().findByClientId(clientId)
+                    .forEach(c -> r.clients().get(c.getId()).remove()));
+            return clientId;
         } catch (ClientRegistrationException cre) {
             fail("Did not expected to fail when dynamically registering client with redirectUris: " + redirectUrisList);
             // Should not be here
@@ -761,11 +649,11 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     private void testSecureRedirectUrisEnforcerExecutor_failUpdateByAdmin(String cId, List<String> redirectUrisList) {
         try {
-            updateClientByAdmin(cId, (ClientRepresentation clientRep) -> {
+            updateClientByAdmin(realm, cId, (ClientRepresentation clientRep) -> {
                 clientRep.setAttributes(new HashMap<>());
                 clientRep.setRedirectUris(redirectUrisList);
             });
-            fail("Expected to failwhen updating clientId " + cId + " with redirectUris: " +redirectUrisList);
+            fail("Expected to fail when updating clientId " + cId + " with redirectUris: " + redirectUrisList);
         } catch (ClientPolicyException cpe) {
             assertEquals(Errors.INVALID_REQUEST, cpe.getError());
         }
@@ -773,7 +661,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     private void testSecureRedirectUrisEnforcerExecutor_failUpdateDynamically(String clientId, List<String> redirectUrisList) {
         try {
-            updateClientDynamically(clientId, (OIDCClientRepresentation clientRep) ->
+            updateClientDynamically(reg, clientId, (OIDCClientRepresentation clientRep) ->
                 clientRep.setRedirectUris(redirectUrisList));
             fail();
         } catch (ClientRegistrationException e) {
@@ -783,7 +671,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
 
     private void testSecureRedirectUrisEnforcerExecutor_successUpdateByAdmin(String cId, List<String> redirectUrisList) {
         try {
-            updateClientByAdmin(cId, (ClientRepresentation clientRep) -> {
+            updateClientByAdmin(realm, cId, (ClientRepresentation clientRep) -> {
                 clientRep.setAttributes(new HashMap<>());
                 clientRep.setRedirectUris(redirectUrisList);
             });
@@ -804,7 +692,7 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
     private void testSecureRedirectUrisEnforcerExecutor_successAuthorizationRequest(String clientId, String redirectUri) {
         oauth.client(clientId, "secret");
         oauth.redirectUri(redirectUri);
-        AuthorizationEndpointResponse response = oauth.doLogin("test-user@localhost", "password");
+        AuthorizationEndpointResponse response = oauth.doLogin(user.getUsername(), user.getPassword());
         Assertions.assertNotNull(response.getCode());
         AccessTokenResponse res = oauth.doAccessTokenRequest(response.getCode());
         assertEquals(200, res.getStatusCode());
@@ -820,5 +708,16 @@ public class SecureRedirectUrisEnforcerExecutorTest extends AbstractClientPolici
                 .details(Details.RESPONSE_TYPE, "code")
                 .details(Details.REDIRECT_URI, redirectUri)
                 .details(Details.CLIENT_POLICY_ERROR, OAuthErrorException.INVALID_REQUEST);
+    }
+
+    private static final class TestUserConfig implements UserConfig {
+
+        @Override
+        public UserBuilder configure(UserBuilder user) {
+            return user.username("test-user@localhost")
+                    .email("test-user@localhost")
+                    .password("password")
+                    .name("test", "user");
+        }
     }
 }
